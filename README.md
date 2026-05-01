@@ -48,7 +48,9 @@ Logging: set `RUST_LOG=info` (or `debug` for more detail).
 ```
 src/
   main.rs           # Composition root: config, MongoDB, service, serve
-  config.rs         # Configuration from environment
+  config/
+    mod.rs          # AppConfig; maps loaded env into typed config (e.g. JWT Duration)
+    env.rs          # LoadedEnv + load() — dotenv + std::env vars + validation
   domain/           # Domain entities (e.g. User)
   error.rs          # AppError + standardized JSON errors
   http/             # routes, handlers, middleware, schemas, openapi
@@ -62,7 +64,7 @@ src/
 
 ## Application flow (summary)
 
-1. **`main`** loads config, creates the MongoDB client, `MongoUserRepository`, `AuthServiceImpl`, wraps them in `Arc<dyn AuthService>` and **`AppState { auth, jwt_secret }`**, builds the `Router`, and calls `axum::serve`.  
+1. **`main`** calls **`AppConfig::from_env()`** (which uses **`config::env::load()`** to read and validate environment variables), then creates the MongoDB client, `MongoUserRepository`, `AuthServiceImpl`, wraps them in `Arc<dyn AuthService>` and **`AppState { auth, jwt_secret }`**, builds the `Router`, and calls `axum::serve`.  
 2. **`routes::router`** merges Swagger routes with API routes, applies **layers** (middleware), then **`.with_state(state)`** once at the end (Axum 0.8 pattern: `Router<Arc<AppState>>` → after providing state, `Router<()>` suitable for `serve`).  
 3. Register/login handlers extract `State<Arc<AppState>>` and `Json<...>`, delegating to **`auth.register` / `auth.login`**. The **`get_me`** handler uses **`Extension<AuthUser>`** populated by the JWT middleware.  
 4. **Service:** validation → Argon2 password hash/verify → read/write users via repository → issue JWT via **`jwt::encode_access_token`** (`sub` = hex `ObjectId`, `exp` / `iat`); **`get_me`** loads the user from the DB via **`find_by_id`**.  
@@ -290,7 +292,7 @@ sequenceDiagram
 | API request/response shapes | `http/schemas.rs` |
 | Global / per-route middleware | `http/routes.rs` — `.layer` or `route_layer(from_fn_with_state(...))`; logic in `http/middleware.rs` |
 | JWT encode/decode | `jwt.rs` (could be split into a shared crate for other services) |
-| New configuration | `config.rs` + `.env.example` |
+| New configuration | `config/mod.rs`, `config/env.rs`, and `.env.example` |
 
 ---
 
