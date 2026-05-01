@@ -1,0 +1,297 @@
+# Auth Service
+
+Authentication service built with **Rust**, **Axum**, and **MongoDB**: user registration, login, **JWT (HS256)** issuance, **`GET /api/v1/auth/getme`** protected by **Bearer JWT validation middleware**, and API documentation via **OpenAPI / Swagger UI** ( **`bearer_auth`** security scheme so you can try tokens in Swagger).
+
+## Requirements
+
+| Component | Version / notes |
+|-----------|-----------------|
+| Rust | Edition **2024** (supported toolchain, e.g. 1.85+) |
+| MongoDB | Network access to an instance (URI in `.env`) |
+| Environment variables | See `.env.example` — required: `MONGODB_URI`, `JWT_SECRET` (at least **32** characters) |
+
+### Main dependencies (crates)
+
+- **axum** — HTTP server and routing  
+- **tower** / **tower-http** — service composition and middleware (CORS, tracing)  
+- **mongodb** + **bson** — user persistence  
+- **argon2** — password hashing  
+- **jsonwebtoken** — JWT encode/decode (signing + **`exp`** validation)  
+- **utoipa** + **utoipa-swagger-ui** — OpenAPI spec and Swagger UI  
+- **validator** — request body validation  
+- **tokio** — async runtime  
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check |
+| `POST` | `/api/v1/auth/register` | Sign up + JWT |
+| `POST` | `/api/v1/auth/login` | Login + JWT |
+| `GET` | `/api/v1/auth/getme` | Current user profile; requires `Authorization: Bearer` plus the access token from login/register |
+| `GET` | `/swagger-ui` | Swagger UI (see also `/api-docs/openapi.json`; use **Authorize** with the JWT) |
+
+## Running locally
+
+1. Copy `.env.example` to `.env` and adjust values.  
+2. Ensure MongoDB is running and reachable.  
+3. From the project root:
+
+```bash
+cargo run
+```
+
+Logging: set `RUST_LOG=info` (or `debug` for more detail).
+
+## Module layout (overview)
+
+```
+src/
+  main.rs           # Composition root: config, MongoDB, service, serve
+  config.rs         # Configuration from environment
+  domain/           # Domain entities (e.g. User)
+  error.rs          # AppError + standardized JSON errors
+  http/             # routes, handlers, middleware, schemas, openapi
+  jwt.rs            # JWT claims + encode/decode (used by service and middleware)
+  repository/       # UserRepository trait + MongoDB implementation
+  service/          # AuthService trait + register / login / get_me
+  state.rs          # AppState (auth service + jwt_secret for middleware)
+```
+
+**Separation:** **domain** is distinct from HTTP **DTOs** (`http/schemas.rs`); persistence sits behind the **`UserRepository`** trait so implementations can be swapped or mocked.
+
+## Application flow (summary)
+
+1. **`main`** loads config, creates the MongoDB client, `MongoUserRepository`, `AuthServiceImpl`, wraps them in `Arc<dyn AuthService>` and **`AppState { auth, jwt_secret }`**, builds the `Router`, and calls `axum::serve`.  
+2. **`routes::router`** merges Swagger routes with API routes, applies **layers** (middleware), then **`.with_state(state)`** once at the end (Axum 0.8 pattern: `Router<Arc<AppState>>` → after providing state, `Router<()>` suitable for `serve`).  
+3. Register/login handlers extract `State<Arc<AppState>>` and `Json<...>`, delegating to **`auth.register` / `auth.login`**. The **`get_me`** handler uses **`Extension<AuthUser>`** populated by the JWT middleware.  
+4. **Service:** validation → Argon2 password hash/verify → read/write users via repository → issue JWT via **`jwt::encode_access_token`** (`sub` = hex `ObjectId`, `exp` / `iat`); **`get_me`** loads the user from the DB via **`find_by_id`**.  
+5. **MongoDB repository:** `users` collection, unique index on `email`, lookup by `_id` for profile.  
+6. Domain errors become HTTP responses via **`IntoResponse`** on `AppError`.
+
+## Data processing
+
+- **Register**  
+  - Normalize email (trim, lowercase).  
+  - Validate password (minimum length, etc. via `validator`).  
+  - Check for duplicate email; hash password with **Argon2**; create user document (`ObjectId`, `created_at`); persist to MongoDB; return JWT + public user projection (no password hash).  
+
+- **Login**  
+  - Find user by email; verify password against stored hash; return JWT + public user.  
+
+- **Get me (`GET /api/v1/auth/getme`)**  
+  - Middleware **`require_jwt`** reads `Authorization: Bearer …`, verifies the JWT with **`jwt_secret`** on `AppState` (same secret used to sign tokens), parses `sub` into `ObjectId`, inserts **`AuthUser`** into request extensions.  
+  - Handler calls **`auth.get_me(user_id)`** → **`find_by_id`** in MongoDB → **`UserPublic`** (no password hash).  
+
+- **JWT**  
+  - Algorithm **HS256**; secret from `JWT_SECRET`; minimal claims: `sub` (user id), `iat`, `exp`. Verification uses **`jsonwebtoken::Validation::default()`** (including **`exp`**).  
+
+- **Not stored in the DB**  
+  - Plain-text passwords; only Argon2 hashes.
+
+## Middleware (current implementation)
+
+Middleware is implemented as **Tower layers** / **Axum `from_fn_with_state`** in `src/http/routes.rs` and `src/http/middleware.rs`:
+
+1. **`TraceLayer::new_for_http()`** (`tower-http::trace`) — HTTP request logging/tracing (via `tracing` / `RUST_LOG`).  
+2. **`CorsLayer`** (`tower-http::cors`) — permissive CORS (`Any`) for origin/method/header (tighten in production).  
+3. **`require_jwt`** — only on **`GET /api/v1/auth/getme`**, via **`route_layer(middleware::from_fn_with_state(state.clone(), require_jwt))`**. It receives **`State<Arc<AppState>>`** (explicit layer state), verifies the Bearer token with **`app.jwt_secret`**, then stores **`AuthUser { user_id }`** in **request extensions** for **`Extension<AuthUser>`** in the handler.
+
+Trace + CORS layers apply to the router that serves `/health` and all `/api/v1/auth/*` routes (including `getme`). Swagger routes are **`merge`**d without those layers unless you move `.layer` up to the parent router.
+
+To add more protected routes, reuse the same pattern: **`get(...).route_layer(from_fn_with_state(..., require_jwt))`** or refactor into a **nested `Router`** with a shared `route_layer`.
+
+## Sequence diagrams (Mermaid)
+
+### Register
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as Axum (Router + layers)
+    participant H as Handler register
+    participant S as AuthService
+    participant R as UserRepository (Mongo)
+    participant D as MongoDB
+
+    C->>A: POST /api/v1/auth/register (JSON)
+    A->>A: CORS + Trace
+    A->>H: State + Json body
+    H->>S: register(RegisterRequest)
+    S->>S: validate, normalize email
+    S->>R: find_by_email
+    R->>D: findOne { email }
+    D-->>R: document / null
+    R-->>S: Option<User>
+    alt email already exists
+        S-->>H: Conflict
+        H-->>C: 409 + ErrorBody
+    else new email
+        S->>S: Argon2 hash password
+        S->>R: create(User)
+        R->>D: insertOne
+        D-->>R: ok
+        S->>S: encode JWT (HS256)
+        S-->>H: AuthResponse
+        H-->>C: 200 + JSON (token + public user)
+    end
+```
+
+### Login
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as Axum (Router + layers)
+    participant H as Handler login
+    participant S as AuthService
+    participant R as UserRepository (Mongo)
+    participant D as MongoDB
+
+    C->>A: POST /api/v1/auth/login (JSON)
+    A->>A: CORS + Trace
+    A->>H: State + Json body
+    H->>S: login(LoginRequest)
+    S->>S: validate, normalize email
+    S->>R: find_by_email
+    R->>D: findOne { email }
+    D-->>R: user document
+    R-->>S: User (with password_hash)
+    alt user missing or wrong password
+        S-->>H: Unauthorized
+        H-->>C: 401 + ErrorBody
+    else valid credentials
+        S->>S: Argon2 verify + JWT encode
+        S-->>H: AuthResponse
+        H-->>C: 200 + JSON
+    end
+```
+
+### High-level request path (server running)
+
+```mermaid
+sequenceDiagram
+    participant L as TcpListener
+    participant X as axum::serve
+    participant R as Router
+    participant M as Middleware stack
+    participant H as Handler
+
+    L->>X: incoming connection
+    X->>R: dispatch request
+    R->>M: layer chain (order follows .layer placement)
+    M->>H: matching path + method
+    H-->>M: Response
+    M-->>R: Response
+    R-->>X: Response
+    X-->>L: to client
+```
+
+### Get me (JWT required)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as Axum (CORS + Trace)
+    participant MW as require_jwt middleware
+    participant H as Handler get_me
+    participant S as AuthService
+    participant R as UserRepository
+    participant D as MongoDB
+
+    C->>A: GET /api/v1/auth/getme + Authorization: Bearer JWT
+    A->>A: CORS + Trace
+    A->>MW: Request
+    MW->>MW: decode JWT, check exp, parse sub → ObjectId
+    alt invalid / missing token
+        MW-->>C: 401 + ErrorBody
+    else valid token
+        MW->>MW: extensions.insert(AuthUser)
+        MW->>H: State + Extension(AuthUser)
+        H->>S: get_me(user_id)
+        S->>R: find_by_id
+        R->>D: findOne { _id }
+        D-->>R: document / null
+        alt user not found
+            S-->>H: Unauthorized
+            H-->>C: 401 + ErrorBody
+        else ok
+            S-->>H: UserPublic
+            H-->>C: 200 + JSON
+        end
+    end
+```
+
+## Extending: another service (e.g. Payment) that only accepts JWT
+
+In **this** service, **`/api/v1/auth/getme`** already validates **Bearer JWT** as described above. You can reuse the same pattern in a separate **payment service**.
+
+For a **payment service** (or another microservice) that only processes requests with a login token:
+
+1. **Shared secret contract**  
+   Use the **same `JWT_SECRET`** as the auth service (or a public key if you move to RS256 + JWKS). With HS256, every verifier must trust the same secret, or you centralize verification at an API gateway.
+
+2. **Flow in the payment service**  
+   - Read the `Authorization: Bearer <token>` header.  
+   - Decode and verify the signature (`jsonwebtoken::decode` + `DecodingKey` from the same secret).  
+   - Enforce `exp` / `iat`; use `sub` as **user id** for charging, idempotency, auditing.  
+   - Return **401** if the token is missing, invalid, or expired.
+
+3. **In Axum**  
+   - Mirror **`http/middleware.rs`** in this repo: **`from_fn_with_state` + `jsonwebtoken` verification + `extensions.insert(...)`**, or use a custom extractor.  
+   - Apply the layer only to routes that require auth (e.g. `/payments/...`).
+
+4. **No per-request call to the auth service**  
+   JWT verification is **local** (cryptographic) as long as secrets/keys align; optional refresh-token denylist / logout may need Redis or extra introspection.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Payment service
+    participant MW as JWT middleware / extractor
+    participant PG as Payment use-case
+
+    C->>P: POST /payments (Authorization: Bearer JWT)
+    P->>MW: verify signature + exp
+    alt invalid token
+        MW-->>C: 401
+    else valid
+        MW->>PG: user id from sub (claims)
+        PG-->>C: 200 + business result
+    end
+```
+
+## Third-party integration
+
+### Payment gateway (HTTP)
+
+- Put HTTP clients (e.g. `reqwest`) in an **infrastructure** module (e.g. `infra::stripe` / `infra::xendit`), not directly in handlers.  
+- The payment **service** calls a `PaymentGateway` **trait** you own; concrete types call the provider API with keys from **environment** / a secret manager.  
+- Use **timeouts**, **bounded retries**, and **idempotency keys** (header or field) to avoid duplicate charges on network failures.  
+- For provider webhooks, verify signatures/timestamps per their docs, then update DB state or publish an event (see brokers below).
+
+### Message broker (Kafka, RabbitMQ, NATS, etc.)
+
+- **Producer:** after important domain events (e.g. `UserRegistered`, `PaymentCompleted`), publish from the **service** or transaction **after** a successful DB commit for consistency.  
+- **Consumer:** separate binary/worker or in-process task; subscribe to topics; idempotency via **message id** or DB deduplication.  
+- Avoid blocking HTTP responses for long async work; for async-style flows, accept the request → write outbox / enqueue → return **202** or a “pending” status if the business allows.
+
+## Adding features in this repo
+
+| Goal | Where to change |
+|------|-----------------|
+| New routes & OpenAPI | `http/handlers`, `http/routes.rs`, `http/openapi.rs` |
+| New business logic | `service/` (+ trait if you need swappable implementations) |
+| New data access | `repository/` (trait + `mongo_*` or other backends) |
+| New entities | `domain/` |
+| API request/response shapes | `http/schemas.rs` |
+| Global / per-route middleware | `http/routes.rs` — `.layer` or `route_layer(from_fn_with_state(...))`; logic in `http/middleware.rs` |
+| JWT encode/decode | `jwt.rs` (could be split into a shared crate for other services) |
+| New configuration | `config.rs` + `.env.example` |
+
+---
+
+This document reflects the project at the time of writing; always verify against the code under `src/` when things change.
