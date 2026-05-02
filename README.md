@@ -8,7 +8,25 @@ Authentication service built with **Rust**, **Axum**, and **MongoDB**: user regi
 |-----------|-----------------|
 | Rust | Edition **2024** (supported toolchain, e.g. 1.85+) |
 | MongoDB | Network access to an instance (URI in `.env`) |
-| Environment variables | See `.env.example` — required: `MONGODB_URI`, `JWT_SECRET` (at least **32** characters) |
+| Environment variables | See `.env.example` — depends on **`APP_MODE`** (below) |
+| **Worker mode** | System **librdkafka** (e.g. macOS: `brew install librdkafka`) — `rdkafka` links dynamically |
+| **Cron mode** | No extra system libs; schedule via `CRON_SCHEDULE` |
+
+### Run modes (`APP_MODE`)
+
+| Value | Behavior | Required env (in addition to shared) |
+|--------|-----------|-------------------------------------|
+| **`api`** (default) | HTTP server (current Axum app + Swagger) | `MONGODB_URI`, `JWT_SECRET` (≥ 32 chars), optional `HOST` / `PORT` |
+| **`worker`** | Kafka **consumer** (logs messages; extend for your handlers) | `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID` |
+| **`cron`** | **`tokio-cron-scheduler`** job (default: every minute) | Optional `CRON_SCHEDULE` (six-field: `sec min hour day month weekday`) |
+
+**Embedding / tests:** the library also exposes **`modes::run_worker_with_handler`** (custom [`MessageHandler`](src/modes/worker/handler.rs)) and **`modes::run_cron_with_task`** (custom [`CronTask`](src/modes/cron/task.rs)) so you can start consumers or schedulers without forking `main`.
+
+```bash
+APP_MODE=api cargo run
+APP_MODE=worker KAFKA_BROKERS=localhost:9092 KAFKA_TOPIC=events KAFKA_GROUP_ID=auth-worker cargo run
+APP_MODE=cron CRON_SCHEDULE='0 * * * * *' cargo run
+```
 
 ### Main dependencies (crates)
 
@@ -20,6 +38,9 @@ Authentication service built with **Rust**, **Axum**, and **MongoDB**: user regi
 - **utoipa** + **utoipa-swagger-ui** — OpenAPI spec and Swagger UI  
 - **validator** — request body validation  
 - **tokio** — async runtime  
+- **rdkafka** — Kafka consumer (**worker** mode; requires system librdkafka)  
+- **tokio-cron-scheduler** — scheduled jobs (**cron** mode)  
+- **futures** — `StreamExt` for the Kafka message stream  
 
 ### Endpoints
 
@@ -47,13 +68,27 @@ Logging: set `RUST_LOG=info` (or `debug` for more detail).
 
 ```
 src/
-  main.rs           # Composition root: config, MongoDB, service, serve
+  main.rs           # Dispatches on LoadedApp::from_env() → modes::api | worker | cron
   config/
-    mod.rs          # AppConfig; maps loaded env into typed config (e.g. JWT Duration)
-    env.rs          # LoadedEnv + load() — dotenv + std::env vars + validation
+    mod.rs          # AppConfig (API), re-exports LoadedApp / mode settings
+    env.rs          # load_api / load_worker / load_cron
+    mode.rs         # AppMode, WorkerSettings, CronSettings, LoadedApp
+  modes/
+    api/
+      mod.rs        # `run` (compose wiring + server)
+      wiring.rs     # Mongo, `AuthService`, `AppState`, `routes::router`
+      server.rs     # bind, logs, `axum::serve`
+    worker/
+      mod.rs        # Consumer loop + `run` / `run_with_handler`
+      kafka.rs      # `StreamConsumer` factory from `WorkerSettings`
+      handler.rs    # `InboundMessage`, `MessageHandler`, default `LogMessageHandler`
+    cron/
+      mod.rs        # `run` / `run_with_task`
+      scheduler.rs  # start, Ctrl+C, shutdown
+      task.rs       # `CronTask`, `LoggingCronTask`, job registration
   domain/           # Domain entities (e.g. User)
   error.rs          # AppError + standardized JSON errors
-  http/             # routes, handlers, middleware, schemas, openapi
+  http/             # routes, middleware, schemas, openapi, handlers/ (auth, health)
   jwt.rs            # JWT claims + encode/decode (used by service and middleware)
   repository/       # UserRepository trait + MongoDB implementation
   service/          # AuthService trait + register / login / get_me
@@ -64,12 +99,12 @@ src/
 
 ## Application flow (summary)
 
-1. **`main`** calls **`AppConfig::from_env()`** (which uses **`config::env::load()`** to read and validate environment variables), then creates the MongoDB client, `MongoUserRepository`, `AuthServiceImpl`, wraps them in `Arc<dyn AuthService>` and **`AppState { auth, jwt_secret }`**, builds the `Router`, and calls `axum::serve`.  
-2. **`routes::router`** merges Swagger routes with API routes, applies **layers** (middleware), then **`.with_state(state)`** once at the end (Axum 0.8 pattern: `Router<Arc<AppState>>` → after providing state, `Router<()>` suitable for `serve`).  
-3. Register/login handlers extract `State<Arc<AppState>>` and `Json<...>`, delegating to **`auth.register` / `auth.login`**. The **`get_me`** handler uses **`Extension<AuthUser>`** populated by the JWT middleware.  
-4. **Service:** validation → Argon2 password hash/verify → read/write users via repository → issue JWT via **`jwt::encode_access_token`** (`sub` = hex `ObjectId`, `exp` / `iat`); **`get_me`** loads the user from the DB via **`find_by_id`**.  
-5. **MongoDB repository:** `users` collection, unique index on `email`, lookup by `_id` for profile.  
-6. Domain errors become HTTP responses via **`IntoResponse`** on `AppError`.
+1. **`main`** calls **`LoadedApp::from_env()`** (`APP_MODE` → validate only the variables for that mode), then **`match`**es on **`LoadedApp::Api` / `Worker` / `Cron`** and runs **`modes::run_api`**, **`run_worker`**, or **`run_cron`**.  
+2. **API mode** (`modes/api/`): **`wiring::build_router`** creates the MongoDB client, `MongoUserRepository`, `AuthServiceImpl`, **`AppState`**, and **`routes::router`**; **`server::listen_and_serve`** binds and runs **`axum::serve`**. **`routes::router`** merges Swagger with API routes, applies **layers** (middleware), then **`.with_state(state)`** once at the end (Axum 0.8: `Router<Arc<AppState>>` → `Router<()>` for `serve`). **Worker** (`modes/worker/`) subscribes via **`kafka::stream_consumer`** and runs the poll loop (**`run_with_handler`** for custom processing). **Cron** (`modes/cron/`) registers jobs and runs **`scheduler::run_until_ctrl_c`** (**`run_with_task`** for custom jobs).  
+3. **(API)** Register/login handlers extract `State<Arc<AppState>>` and `Json<...>`, delegating to **`auth.register` / `auth.login`**. The **`get_me`** handler uses **`Extension<AuthUser>`** populated by the JWT middleware.  
+4. **(API)** **Service:** validation → Argon2 password hash/verify → read/write users via repository → issue JWT via **`jwt::encode_access_token`** (`sub` = hex `ObjectId`, `exp` / `iat`); **`get_me`** loads the user from the DB via **`find_by_id`**.  
+5. **(API)** **MongoDB repository:** `users` collection, unique index on `email`, lookup by `_id` for profile.  
+6. **(API)** Domain errors become HTTP responses via **`IntoResponse`** on `AppError`.
 
 ## Data processing
 
@@ -285,14 +320,21 @@ sequenceDiagram
 
 | Goal | Where to change |
 |------|-----------------|
-| New routes & OpenAPI | `http/handlers`, `http/routes.rs`, `http/openapi.rs` |
+| New routes & OpenAPI | `http/handlers/` (`auth.rs`, `health.rs`), `http/routes.rs`, `http/openapi.rs` |
 | New business logic | `service/` (+ trait if you need swappable implementations) |
 | New data access | `repository/` (trait + `mongo_*` or other backends) |
 | New entities | `domain/` |
 | API request/response shapes | `http/schemas.rs` |
 | Global / per-route middleware | `http/routes.rs` — `.layer` or `route_layer(from_fn_with_state(...))`; logic in `http/middleware.rs` |
 | JWT encode/decode | `jwt.rs` (could be split into a shared crate for other services) |
-| New configuration | `config/mod.rs`, `config/env.rs`, and `.env.example` |
+| API composition (DB + router) vs listen | `modes/api/wiring.rs` vs `modes/api/server.rs` |
+| Kafka consumer wiring / message handling | `modes/worker/kafka.rs`, `modes/worker/handler.rs`, `modes/worker/mod.rs` |
+| Cron job logic / schedule lifecycle | `modes/cron/task.rs`, `modes/cron/scheduler.rs`, `modes/cron/mod.rs` |
+| New configuration / mode | `config/mod.rs`, `config/env.rs`, `config/mode.rs`, `modes/`, `.env.example` |
+
+### Crate layout
+
+The package is a **library** (`lib.rs`) plus a **binary** (`main.rs`). Integration tests or other binaries can `use auth_service::modes::…` and call **`run_api`**, **`run_worker`**, **`run_worker_with_handler`**, **`run_cron`**, or **`run_cron_with_task`** with config loaded however you prefer (not only `LoadedApp::from_env()`).
 
 ---
 

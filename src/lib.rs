@@ -3,6 +3,7 @@ pub mod domain;
 pub mod error;
 pub mod http;
 pub mod jwt;
+pub mod modes;
 pub mod repository;
 pub mod service;
 pub mod state;

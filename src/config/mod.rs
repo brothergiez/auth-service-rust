@@ -1,10 +1,13 @@
 mod env;
+mod mode;
 
 use std::time::Duration;
 
+pub use mode::{AppMode, CronSettings, LoadedApp, WorkerSettings};
+
 use crate::error::AppError;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppConfig {
     pub mongodb_uri: String,
     pub database_name: String,
@@ -15,15 +18,9 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Load **API-only** config (use [`LoadedApp::from_env`] for multi-mode).
     pub fn from_env() -> Result<Self, AppError> {
-        let e = env::load()?;
-        Ok(Self {
-            mongodb_uri: e.mongodb_uri,
-            database_name: e.database_name,
-            jwt_secret: e.jwt_secret,
-            jwt_expiration: Duration::from_secs(e.jwt_expiration_secs),
-            host: e.host,
-            port: e.port,
-        })
+        dotenvy::dotenv().ok();
+        env::load_api()
     }
 }
