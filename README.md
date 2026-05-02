@@ -41,6 +41,7 @@ APP_MODE=cron CRON_SCHEDULE='0 * * * * *' cargo run
 - **rdkafka** — Kafka consumer (**worker** mode; requires system librdkafka)  
 - **tokio-cron-scheduler** — scheduled jobs (**cron** mode)  
 - **futures** — `StreamExt` for the Kafka message stream  
+- **async-trait** — async traits (`AuthService`, `UserRepository`, `MessageHandler`, `CronTask`)  
 
 ### Endpoints
 
@@ -68,7 +69,8 @@ Logging: set `RUST_LOG=info` (or `debug` for more detail).
 
 ```
 src/
-  main.rs           # Dispatches on LoadedApp::from_env() → modes::api | worker | cron
+  lib.rs            # Crate root: re-exports config, domain, http, modes, …
+  main.rs           # Binary: LoadedApp::from_env() → modes::run_api | run_worker | run_cron
   config/
     mod.rs          # AppConfig (API), re-exports LoadedApp / mode settings
     env.rs          # load_api / load_worker / load_cron
@@ -86,12 +88,30 @@ src/
       mod.rs        # `run` / `run_with_task`
       scheduler.rs  # start, Ctrl+C, shutdown
       task.rs       # `CronTask`, `LoggingCronTask`, job registration
-  domain/           # Domain entities (e.g. User)
-  error.rs          # AppError + standardized JSON errors
-  http/             # routes, middleware, schemas, openapi, handlers/ (auth, health)
-  jwt.rs            # JWT claims + encode/decode (used by service and middleware)
-  repository/       # UserRepository trait + MongoDB implementation
-  service/          # AuthService trait + register / login / get_me
+  domain/
+    mod.rs
+    user.rs         # User entity
+  error/
+    mod.rs          # AppError + ErrorBody + IntoResponse + From impls
+  http/
+    mod.rs          # submodules + re-export ApiDoc
+    routes.rs
+    middleware.rs   # require_jwt, AuthUser
+    openapi.rs
+    schemas.rs
+    handlers/
+      mod.rs
+      auth.rs
+      health.rs
+  jwt/
+    mod.rs          # AccessClaims + encode/decode (service + middleware)
+  repository/
+    mod.rs
+    user_repository.rs
+    mongo_user_repository.rs
+  service/
+    mod.rs
+    auth.rs         # AuthServiceImpl + trait wiring
   state.rs          # AppState (auth service + jwt_secret for middleware)
 ```
 
@@ -104,7 +124,7 @@ src/
 3. **(API)** Register/login handlers extract `State<Arc<AppState>>` and `Json<...>`, delegating to **`auth.register` / `auth.login`**. The **`get_me`** handler uses **`Extension<AuthUser>`** populated by the JWT middleware.  
 4. **(API)** **Service:** validation → Argon2 password hash/verify → read/write users via repository → issue JWT via **`jwt::encode_access_token`** (`sub` = hex `ObjectId`, `exp` / `iat`); **`get_me`** loads the user from the DB via **`find_by_id`**.  
 5. **(API)** **MongoDB repository:** `users` collection, unique index on `email`, lookup by `_id` for profile.  
-6. **(API)** Domain errors become HTTP responses via **`IntoResponse`** on `AppError`.
+6. **(API)** Domain errors become HTTP responses via **`IntoResponse`** on **`error::AppError`** (`error/mod.rs`).
 
 ## Data processing
 
@@ -326,7 +346,8 @@ sequenceDiagram
 | New entities | `domain/` |
 | API request/response shapes | `http/schemas.rs` |
 | Global / per-route middleware | `http/routes.rs` — `.layer` or `route_layer(from_fn_with_state(...))`; logic in `http/middleware.rs` |
-| JWT encode/decode | `jwt.rs` (could be split into a shared crate for other services) |
+| API error type + JSON error body (`ErrorBody`) | `error/mod.rs` |
+| JWT encode/decode | `jwt/mod.rs` (could be a shared crate for other services) |
 | API composition (DB + router) vs listen | `modes/api/wiring.rs` vs `modes/api/server.rs` |
 | Kafka consumer wiring / message handling | `modes/worker/kafka.rs`, `modes/worker/handler.rs`, `modes/worker/mod.rs` |
 | Cron job logic / schedule lifecycle | `modes/cron/task.rs`, `modes/cron/scheduler.rs`, `modes/cron/mod.rs` |
