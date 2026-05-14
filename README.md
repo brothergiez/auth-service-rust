@@ -1,22 +1,23 @@
 # Auth Service
 
-Authentication service built with **Rust**, **Axum**, and **MongoDB**: user registration, login, **JWT (HS256)** issuance, **`GET /api/v1/auth/getme`** protected by **Bearer JWT validation middleware**, and API documentation via **OpenAPI / Swagger UI** ( **`bearer_auth`** security scheme so you can try tokens in Swagger).
+Authentication service built with **Rust**, **Axum**, and **MongoDB or MySQL** (switch with **`DATABASE_DRIVER`**), optional **Redis** (`REDIS_URL`), user registration, login, **JWT (HS256)** issuance, **`GET /api/v1/auth/getme`** protected by **Bearer JWT validation middleware**, and API documentation via **OpenAPI / Swagger UI** ( **`bearer_auth`** security scheme so you can try tokens in Swagger).
 
 ## Requirements
 
 | Component | Version / notes |
 |-----------|-----------------|
 | Rust | Edition **2024** (supported toolchain, e.g. 1.85+) |
-| MongoDB | Network access to an instance (URI in `.env`) |
+| **API database** | **MongoDB** (`DATABASE_DRIVER=mongo`, `MONGODB_URI`) **or** **MySQL** (`DATABASE_DRIVER=mysql`, `DATABASE_URL`); SQL migrations in **`migrations/`** run automatically on API startup for MySQL |
 | Environment variables | See `.env.example` — depends on **`APP_MODE`** (below) |
 | **Worker mode** | System **librdkafka** (e.g. macOS: `brew install librdkafka`) — `rdkafka` links dynamically |
 | **Cron mode** | No extra system libs; schedule via `CRON_SCHEDULE` |
+| **Redis (API, optional)** | If **`REDIS_URL`** is set, the API opens an async **`ConnectionManager`** at startup and exposes **`AppState.redis`** for cache / rate limiting / sessions (handlers use `State<Arc<AppState>>`) |
 
 ### Run modes (`APP_MODE`)
 
 | Value | Behavior | Required env (in addition to shared) |
 |--------|-----------|-------------------------------------|
-| **`api`** (default) | HTTP server (current Axum app + Swagger) | `MONGODB_URI`, `JWT_SECRET` (≥ 32 chars), optional `HOST` / `PORT` |
+| **`api`** (default) | HTTP server (Axum + Swagger) | **`JWT_SECRET`** (≥ 32 chars); **`DATABASE_DRIVER=mongo`** (default): **`MONGODB_URI`**, optional **`DATABASE_NAME`**; **`mysql`**: **`DATABASE_URL`**; optional **`REDIS_URL`**, **`HOST`**, **`PORT`** |
 | **`worker`** | Kafka **consumer** (logs messages; extend for your handlers) | `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID` |
 | **`cron`** | **`tokio-cron-scheduler`** job (default: every minute) | Optional `CRON_SCHEDULE` (six-field: `sec min hour day month weekday`) |
 
@@ -24,6 +25,7 @@ Authentication service built with **Rust**, **Axum**, and **MongoDB**: user regi
 
 ```bash
 APP_MODE=api cargo run
+DATABASE_DRIVER=mysql DATABASE_URL='mysql://user:pass@127.0.0.1:3306/auth_service' APP_MODE=api cargo run
 APP_MODE=worker KAFKA_BROKERS=localhost:9092 KAFKA_TOPIC=events KAFKA_GROUP_ID=auth-worker cargo run
 APP_MODE=cron CRON_SCHEDULE='0 * * * * *' cargo run
 ```
@@ -32,12 +34,14 @@ APP_MODE=cron CRON_SCHEDULE='0 * * * * *' cargo run
 
 - **axum** — HTTP server and routing  
 - **tower** / **tower-http** — service composition and middleware (CORS, tracing)  
-- **mongodb** + **bson** — user persistence  
+- **mongodb** + **bson** — user persistence (**`DATABASE_DRIVER=mongo`**)  
+- **sqlx** (MySQL runtime + **migrate** + **macros**) — user persistence and schema migrations (**`DATABASE_DRIVER=mysql`**)  
 - **argon2** — password hashing  
 - **jsonwebtoken** — JWT encode/decode (signing + **`exp`** validation)  
 - **utoipa** + **utoipa-swagger-ui** — OpenAPI spec and Swagger UI  
 - **validator** — request body validation  
 - **tokio** — async runtime  
+- **redis** ( **`tokio-comp`**, **`connection-manager`**) — optional API cache / pub-sub (`REDIS_URL`)  
 - **rdkafka** — Kafka consumer (**worker** mode; requires system librdkafka)  
 - **tokio-cron-scheduler** — scheduled jobs (**cron** mode)  
 - **futures** — `StreamExt` for the Kafka message stream  
@@ -56,7 +60,7 @@ APP_MODE=cron CRON_SCHEDULE='0 * * * * *' cargo run
 ## Running locally
 
 1. Copy `.env.example` to `.env` and adjust values.  
-2. Ensure MongoDB is running and reachable.  
+2. Start the database you configured (**MongoDB** or **MySQL**). For MySQL, create the empty database named in **`DATABASE_URL`** before the first run (migrations create the **`users`** table). If you set **`REDIS_URL`**, ensure Redis is reachable before starting the API.  
 3. From the project root:
 
 ```bash
@@ -65,20 +69,23 @@ cargo run
 
 Logging: set `RUST_LOG=info` (or `debug` for more detail).
 
+**Environment variables:** follow **`.env.example`** — (1) `APP_MODE`, (2) API user storage (`DATABASE_DRIVER` + either Mongo **or** MySQL vars), (3) JWT / HTTP, optional Redis (`REDIS_URL`), then worker or cron blocks only if you use those modes.
+
 ## Module layout (overview)
 
 ```
+migrations/         # SQL migrations (MySQL only; applied on API startup)
 src/
   lib.rs            # Crate root: re-exports config, domain, http, modes, …
   main.rs           # Binary: LoadedApp::from_env() → modes::run_api | run_worker | run_cron
   config/
-    mod.rs          # AppConfig (API), re-exports LoadedApp / mode settings
+    mod.rs          # AppConfig (`DatabaseSettings`), LoadedApp re-exports
     env.rs          # load_api / load_worker / load_cron
     mode.rs         # AppMode, WorkerSettings, CronSettings, LoadedApp
   modes/
     api/
       mod.rs        # `run` (compose wiring + server)
-      wiring.rs     # Mongo, `AuthService`, `AppState`, `routes::router`
+      wiring.rs     # `DatabaseSettings` → `UserRepository`, `AuthService`, `AppState`, `routes::router`
       server.rs     # bind, logs, `axum::serve`
     worker/
       mod.rs        # Consumer loop + `run` / `run_with_handler`
@@ -109,10 +116,11 @@ src/
     mod.rs
     user_repository.rs
     mongo_user_repository.rs
+    mysql_user_repository.rs
   service/
     mod.rs
     auth.rs         # AuthServiceImpl + trait wiring
-  state.rs          # AppState (auth service + jwt_secret for middleware)
+  state.rs          # AppState (auth, jwt_secret, optional redis::ConnectionManager)
 ```
 
 **Separation:** **domain** is distinct from HTTP **DTOs** (`http/schemas.rs`); persistence sits behind the **`UserRepository`** trait so implementations can be swapped or mocked.
@@ -120,10 +128,10 @@ src/
 ## Application flow (summary)
 
 1. **`main`** calls **`LoadedApp::from_env()`** (`APP_MODE` → validate only the variables for that mode), then **`match`**es on **`LoadedApp::Api` / `Worker` / `Cron`** and runs **`modes::run_api`**, **`run_worker`**, or **`run_cron`**.  
-2. **API mode** (`modes/api/`): **`wiring::build_router`** creates the MongoDB client, `MongoUserRepository`, `AuthServiceImpl`, **`AppState`**, and **`routes::router`**; **`server::listen_and_serve`** binds and runs **`axum::serve`**. **`routes::router`** merges Swagger with API routes, applies **layers** (middleware), then **`.with_state(state)`** once at the end (Axum 0.8: `Router<Arc<AppState>>` → `Router<()>` for `serve`). **Worker** (`modes/worker/`) subscribes via **`kafka::stream_consumer`** and runs the poll loop (**`run_with_handler`** for custom processing). **Cron** (`modes/cron/`) registers jobs and runs **`scheduler::run_until_ctrl_c`** (**`run_with_task`** for custom jobs).  
+2. **API mode** (`modes/api/`): **`wiring::build_router`** matches **`config.database`** (**`DatabaseSettings::Mongo`** → Mongo client + **`MongoUserRepository`**; **`Mysql`** → pool + migrations + **`MysqlUserRepository`**), builds **`AuthServiceImpl`** over **`Arc<dyn UserRepository>`**, **`AppState`**, and **`routes::router`**; **`server::listen_and_serve`** runs **`axum::serve`**. **`routes::router`** merges Swagger with API routes, applies **layers** (middleware), then **`.with_state(state)`** once at the end (Axum 0.8: `Router<Arc<AppState>>` → `Router<()>` for `serve`). **Worker** (`modes/worker/`) subscribes via **`kafka::stream_consumer`** and runs the poll loop (**`run_with_handler`** for custom processing). **Cron** (`modes/cron/`) registers jobs and runs **`scheduler::run_until_ctrl_c`** (**`run_with_task`** for custom jobs).  
 3. **(API)** Register/login handlers extract `State<Arc<AppState>>` and `Json<...>`, delegating to **`auth.register` / `auth.login`**. The **`get_me`** handler uses **`Extension<AuthUser>`** populated by the JWT middleware.  
 4. **(API)** **Service:** validation → Argon2 password hash/verify → read/write users via repository → issue JWT via **`jwt::encode_access_token`** (`sub` = hex `ObjectId`, `exp` / `iat`); **`get_me`** loads the user from the DB via **`find_by_id`**.  
-5. **(API)** **MongoDB repository:** `users` collection, unique index on `email`, lookup by `_id` for profile.  
+5. **(API)** **Persistence:** **Mongo** — `users` collection, unique index on `email`, lookup by `_id`. **MySQL** — `users` table (24-char hex `id` matching **`ObjectId`** / JWT `sub`), unique `email`; **`sqlx::migrate!`** on startup.  
 6. **(API)** Domain errors become HTTP responses via **`IntoResponse`** on **`error::AppError`** (`error/mod.rs`).
 
 ## Data processing
@@ -342,13 +350,15 @@ sequenceDiagram
 |------|-----------------|
 | New routes & OpenAPI | `http/handlers/` (`auth.rs`, `health.rs`), `http/routes.rs`, `http/openapi.rs` |
 | New business logic | `service/` (+ trait if you need swappable implementations) |
-| New data access | `repository/` (trait + `mongo_*` or other backends) |
+| New data access | `repository/` (`UserRepository` + `mongo_*` / `mysql_*`) |
+| MySQL schema changes | Add a versioned file under **`migrations/`** (same embedded migrator as startup) |
+| Switch DB driver | `.env` **`DATABASE_DRIVER`** + **`config/env.rs`** / **`DatabaseSettings`** |
 | New entities | `domain/` |
 | API request/response shapes | `http/schemas.rs` |
 | Global / per-route middleware | `http/routes.rs` — `.layer` or `route_layer(from_fn_with_state(...))`; logic in `http/middleware.rs` |
 | API error type + JSON error body (`ErrorBody`) | `error/mod.rs` |
 | JWT encode/decode | `jwt/mod.rs` (could be a shared crate for other services) |
-| API composition (DB + router) vs listen | `modes/api/wiring.rs` vs `modes/api/server.rs` |
+| Optional Redis in API | `.env` **`REDIS_URL`**; wiring in `modes/api/wiring.rs`; use `state.redis` in handlers |
 | Kafka consumer wiring / message handling | `modes/worker/kafka.rs`, `modes/worker/handler.rs`, `modes/worker/mod.rs` |
 | Cron job logic / schedule lifecycle | `modes/cron/task.rs`, `modes/cron/scheduler.rs`, `modes/cron/mod.rs` |
 | New configuration / mode | `config/mod.rs`, `config/env.rs`, `config/mode.rs`, `modes/`, `.env.example` |

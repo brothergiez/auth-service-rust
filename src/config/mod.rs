@@ -7,10 +7,23 @@ pub use mode::{AppMode, CronSettings, LoadedApp, WorkerSettings};
 
 use crate::error::AppError;
 
+/// Which persistence backend the API uses (selected at deploy time via `DATABASE_DRIVER`).
+#[derive(Clone, Debug)]
+pub enum DatabaseSettings {
+    Mongo {
+        uri: String,
+        database_name: String,
+    },
+    Mysql {
+        url: String,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub mongodb_uri: String,
-    pub database_name: String,
+    pub database: DatabaseSettings,
+    /// When `Some`, the API opens a Redis connection manager on startup (`REDIS_URL` in `.env`).
+    pub redis_url: Option<String>,
     pub jwt_secret: String,
     pub jwt_expiration: Duration,
     pub host: String,

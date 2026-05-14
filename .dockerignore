@@ -1,0 +1,15 @@
+# Build cache / VCS
+target
+.git
+.gitignore
+
+# Local env (inject at `docker run` / compose)
+.env
+.env.*
+!.env.example
+
+# IDE / docs (not needed to compile)
+.cursor
+.vscode
+*.md
+docs

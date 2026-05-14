@@ -55,6 +55,17 @@ impl From<mongodb::error::Error> for AppError {
     }
 }
 
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        match &err {
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                AppError::Conflict(db.message().to_string())
+            }
+            _ => AppError::Database(err.to_string()),
+        }
+    }
+}
+
 impl From<argon2::password_hash::Error> for AppError {
     fn from(err: argon2::password_hash::Error) -> Self {
         AppError::Internal(err.to_string())

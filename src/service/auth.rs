@@ -59,7 +59,7 @@ impl<R: UserRepository + ?Sized> AuthServiceImpl<R> {
 }
 
 #[async_trait]
-impl<R: UserRepository + Send + Sync> AuthService for AuthServiceImpl<R> {
+impl<R: UserRepository + Send + Sync + ?Sized> AuthService for AuthServiceImpl<R> {
     async fn register(&self, req: RegisterRequest) -> Result<AuthResponse, AppError> {
         req.validate()?;
         let email = req.email.trim().to_lowercase();
