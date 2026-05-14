@@ -103,7 +103,11 @@ src/
   http/
     mod.rs          # submodules + re-export ApiDoc
     routes.rs
-    middleware.rs   # require_jwt, AuthUser
+    middleware/
+      mod.rs          # re-exports + submodules
+      auth.rs         # `require_jwt`, `AuthUser`
+      request_log.rs  # JSON access log (`log_request`)
+      redact.rs       # header/body redaction for logging
     openapi.rs
     schemas.rs
     handlers/
@@ -156,13 +160,13 @@ src/
 
 ## Middleware (current implementation)
 
-Middleware is implemented as **Tower layers** / **Axum `from_fn_with_state`** in `src/http/routes.rs` and `src/http/middleware.rs`:
+Middleware is implemented as **Tower layers** / **Axum `from_fn` / `from_fn_with_state`** in `src/http/routes.rs` and `src/http/middleware/`:
 
-1. **`TraceLayer::new_for_http()`** (`tower-http::trace`) — HTTP request logging/tracing (via `tracing` / `RUST_LOG`).  
-2. **`CorsLayer`** (`tower-http::cors`) — permissive CORS (`Any`) for origin/method/header (tighten in production).  
+1. **`log_request`** — root **`from_fn`**: emits **one JSON object per line** (target `http_request`) shaped like `{"http_request":{"method","path","status","latency_ms","request_headers","request_body","response_headers","response_body"}}`. **`request_headers`** / **`response_headers`** are JSON objects with **lowercase** keys; sensitive header names map to **`"<redacted>"`**. **`request_body`** / **`response_body`** are parsed JSON when `Content-Type` is JSON (recursive redaction for keys such as **`password`**, **`access_token`**, **`token`**, …); empty body → **`null`**; non-JSON → string. Buffers up to **256 KiB** per direction (**`413`** if the request exceeds that). **`/swagger-ui`** and **`/api-docs/*`** log **`"response_body":"<omitted>"`** (string) to skip huge OpenAPI payloads. With the default **`tracing_subscriber::fmt`** layer, the line is usually prefixed by timestamp/level (use a JSON subscriber or `fmt::layer().json()` if you need a bare JSON-only line).  
+2. **`CorsLayer`** (`tower-http::cors`) — on the API sub-router only: permissive CORS (`Any`) for origin/method/header (tighten in production).  
 3. **`require_jwt`** — only on **`GET /api/v1/auth/getme`**, via **`route_layer(middleware::from_fn_with_state(state.clone(), require_jwt))`**. It receives **`State<Arc<AppState>>`** (explicit layer state), verifies the Bearer token with **`app.jwt_secret`**, then stores **`AuthUser { user_id }`** in **request extensions** for **`Extension<AuthUser>`** in the handler.
 
-Trace + CORS layers apply to the router that serves `/health` and all `/api/v1/auth/*` routes (including `getme`). Swagger routes are **`merge`**d without those layers unless you move `.layer` up to the parent router.
+**`log_request`** runs for **all** merged routes (Swagger UI, OpenAPI JSON, `/health`, `/api/v1/auth/*`). CORS still applies only to the API router subtree.
 
 To add more protected routes, reuse the same pattern: **`get(...).route_layer(from_fn_with_state(..., require_jwt))`** or refactor into a **nested `Router`** with a shared `route_layer`.
 
@@ -306,7 +310,7 @@ For a **payment service** (or another microservice) that only processes requests
    - Return **401** if the token is missing, invalid, or expired.
 
 3. **In Axum**  
-   - Mirror **`http/middleware.rs`** in this repo: **`from_fn_with_state` + `jsonwebtoken` verification + `extensions.insert(...)`**, or use a custom extractor.  
+   - Mirror **`http/middleware/auth.rs`** in this repo: **`from_fn_with_state` + `jsonwebtoken` verification + `extensions.insert(...)`**, or use a custom extractor.  
    - Apply the layer only to routes that require auth (e.g. `/payments/...`).
 
 4. **No per-request call to the auth service**  
@@ -355,7 +359,7 @@ sequenceDiagram
 | Switch DB driver | `.env` **`DATABASE_DRIVER`** + **`config/env.rs`** / **`DatabaseSettings`** |
 | New entities | `domain/` |
 | API request/response shapes | `http/schemas.rs` |
-| Global / per-route middleware | `http/routes.rs` — `.layer` or `route_layer(from_fn_with_state(...))`; logic in `http/middleware.rs` |
+| Global / per-route middleware | `http/routes.rs` — `.layer` or `route_layer(from_fn_with_state(...))`; logic in `http/middleware/` |
 | API error type + JSON error body (`ErrorBody`) | `error/mod.rs` |
 | JWT encode/decode | `jwt/mod.rs` (could be a shared crate for other services) |
 | Optional Redis in API | `.env` **`REDIS_URL`**; wiring in `modes/api/wiring.rs`; use `state.redis` in handlers |

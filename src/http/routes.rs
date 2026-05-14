@@ -4,12 +4,11 @@ use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::http::handlers;
-use crate::http::middleware::require_jwt;
+use crate::http::middleware::{log_request, require_jwt};
 use crate::http::ApiDoc;
 use crate::state::AppState;
 
@@ -32,12 +31,12 @@ pub fn router(state: Arc<AppState>) -> Router {
                 require_jwt,
             )),
         )
-        .layer(TraceLayer::new_for_http())
         .layer(cors);
 
     let openapi = ApiDoc::openapi();
     Router::<Arc<AppState>>::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi))
         .merge(api)
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
